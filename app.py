@@ -199,7 +199,7 @@ def make_client():
             write=180,
             pool=20,
         ),
-        http2=True,
+        http2=False,
     )
 
 
