@@ -63,7 +63,7 @@ def open_url(url: str):
 
     with browser_lock:
         current_page.goto(url, wait_until="domcontentloaded", timeout=120000)
-        current_page.wait_for_timeout(1500)
+        current_page.wait_for_timeout(5000)
         return {
             "url": current_page.url,
             "html": current_page.content(),
