@@ -203,7 +203,7 @@ def make_client():
     )
 
 
-def forwarded_headers():
+def forwarded_headers(target_url):
     excluded = {
         "host",
         "content-length",
@@ -216,6 +216,17 @@ def forwarded_headers():
         for key, value in request.headers
         if key.lower() not in excluded
     }
+
+    # Rewrite proxy-origin headers to the upstream site's origin.
+    # Otherwise APIs and CDNs may reject requests because they see the proxy host.
+    target = urlparse(target_url)
+    target_origin = f"{target.scheme}://{target.netloc}"
+
+    if "origin" in headers:
+        headers["Origin"] = target_origin
+
+    if "referer" in headers:
+        headers["Referer"] = target_origin + "/"
 
     # Avoid compressed upstream bodies because HTML/CSS must be rewritten.
     headers["Accept-Encoding"] = "identity"
@@ -258,7 +269,7 @@ def proxy_request(target):
 
     current_url = target
 
-    headers = forwarded_headers()
+    headers = forwarded_headers(target)
 
     cookies = request.cookies.to_dict()
     cookies.pop("vpn_target", None)
