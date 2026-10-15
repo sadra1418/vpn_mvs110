@@ -4,9 +4,41 @@ import re
 import httpx
 from flask import Flask, make_response, redirect, request
 
-from config import TARGET_URL
+from config import PORT, TARGET_URL
+from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
+
+# Reuse one Chromium process; browser operations are serialized for safety.
+playwright_instance = None
+browser_instance = None
+from threading import RLock
+browser_lock = RLock()
+
+
+def get_browser():
+    global playwright_instance, browser_instance
+    if browser_instance is None or not browser_instance.is_connected():
+        playwright_instance = sync_playwright().start()
+        browser_instance = playwright_instance.chromium.launch(
+            headless=True,
+            args=["--no-sandbox"],
+        )
+    return browser_instance
+
+
+def render_with_playwright(target_url):
+    """Load HTML in Chromium so client-side JavaScript can render before proxying."""
+    browser = get_browser()
+    context = browser.new_context(java_script_enabled=True)
+    try:
+        page = context.new_page()
+        page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(1200)
+        return page.content(), page.url
+    finally:
+        context.close()
+
 
 parsed_target = urlparse(TARGET_URL)
 TARGET_ORIGIN = f"{parsed_target.scheme}://{parsed_target.netloc}"
@@ -165,9 +197,22 @@ def proxy_request(target):
     content_type = response.headers.get("content-type", "")
     body = response.content
 
-    if "text/html" in content_type:
-        text = response.text
-        text = rewrite_html(text, target_origin)
+    if "text/html" in content_type and request.method == "GET":
+        try:
+            with browser_lock:
+                rendered_html, final_url = render_with_playwright(target)
+            final_parsed = urlparse(final_url)
+            final_origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
+            text = rewrite_html(rendered_html, final_origin)
+            body = text.encode("utf-8")
+        except Exception as exc:
+            # Keep the original HTTPX response as a fallback if Chromium cannot render.
+            text = rewrite_html(response.text, target_origin)
+            body = text.encode(response.encoding or "utf-8")
+            app.logger.warning("Playwright rendering failed for %s: %s", target, exc)
+
+    elif "text/html" in content_type:
+        text = rewrite_html(response.text, target_origin)
         body = text.encode(response.encoding or "utf-8")
 
     elif "text/css" in content_type:
