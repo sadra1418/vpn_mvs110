@@ -34,6 +34,19 @@ def render_with_playwright(target_url):
     try:
         page = context.new_page()
         response = page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+        # Only wait for client-side content when the initial DOM is nearly empty.
+        try:
+            initial_text = (page.locator("body").inner_text(timeout=1000) or "").strip()
+        except Exception:
+            initial_text = ""
+        if len(initial_text) < 120:
+            try:
+                page.wait_for_function(
+                    "document.body && document.body.innerText.trim().length >= 120",
+                    timeout=4000,
+                )
+            except Exception:
+                pass
         return page.content(), page.url, (response.status if response else 200)
     finally:
         context.close()
