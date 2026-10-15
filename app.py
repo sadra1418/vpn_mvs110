@@ -153,25 +153,25 @@ def rewrite_html(html, target_origin):
     return html
 
 
+def needs_browser_render(html):
+    """Detect an almost-empty JavaScript application shell."""
+    lowered = html.lower()
+    markers = ('id="root"', "id='root'", 'id="app"', "id='app'",
+               'id="__next"', "id='__next'", 'id="svelte"', "id='svelte'",
+               "data-reactroot")
+    if not any(marker in lowered for marker in markers):
+        return False
+    visible = re.sub(r"<(script|style|noscript)\b[^>]*>.*?</\1>", " ", html,
+                     flags=re.IGNORECASE | re.DOTALL)
+    visible = re.sub(r"<[^>]+>", " ", visible)
+    visible = re.sub(r"&(?:nbsp|amp|lt|gt|quot);", " ", visible, flags=re.IGNORECASE)
+    visible = re.sub(r"\s+", " ", visible).strip()
+    return len(visible) < 350
+
+
 def proxy_request(target):
     parsed = urlparse(target)
     target_origin = f"{parsed.scheme}://{parsed.netloc}"
-
-    # Browser navigation is already the HTML fetch. Do not fetch the same
-    # document once with HTTPX and then a second time with Chromium.
-    accepts_html = "text/html" in request.headers.get("Accept", "")
-    if request.method == "GET" and accepts_html:
-        try:
-            with browser_lock:
-                rendered_html, final_url, browser_status = render_with_playwright(target)
-            final_parsed = urlparse(final_url)
-            final_origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
-            html = rewrite_html(rendered_html, final_origin)
-            result = make_response(html.encode("utf-8"), browser_status)
-            result.headers["Content-Type"] = "text/html; charset=utf-8"
-            return result
-        except Exception as exc:
-            app.logger.warning("Playwright navigation failed for %s; falling back to HTTPX: %s", target, exc)
 
     headers = {
         key: value
@@ -213,19 +213,24 @@ def proxy_request(target):
     body = response.content
 
     if "text/html" in content_type and request.method == "GET":
-        try:
-            with browser_lock:
-                rendered_html, final_url = render_with_playwright(target)
-            final_parsed = urlparse(final_url)
-            final_origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
-            text = rewrite_html(rendered_html, final_origin)
-            body = text.encode("utf-8")
-        except Exception as exc:
-            # Keep the original HTTPX response as a fallback if Chromium cannot render.
-            text = rewrite_html(response.text, target_origin)
+        original_html = response.text
+        response_status = response.status_code
+        if needs_browser_render(original_html):
+            try:
+                with browser_lock:
+                    rendered_html, final_url, browser_status = render_with_playwright(target)
+                final_parsed = urlparse(final_url)
+                final_origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
+                response_status = browser_status
+                text = rewrite_html(rendered_html, final_origin)
+                body = text.encode("utf-8")
+            except Exception as exc:
+                text = rewrite_html(original_html, target_origin)
+                body = text.encode(response.encoding or "utf-8")
+                app.logger.warning("Playwright rendering failed for %s: %s", target, exc)
+        else:
+            text = rewrite_html(original_html, target_origin)
             body = text.encode(response.encoding or "utf-8")
-            app.logger.warning("Playwright rendering failed for %s: %s", target, exc)
-
     elif "text/html" in content_type:
         text = rewrite_html(response.text, target_origin)
         body = text.encode(response.encoding or "utf-8")
@@ -243,7 +248,7 @@ def proxy_request(target):
         )
         body = text.encode(response.encoding or "utf-8")
 
-    flask_response = make_response(body, response.status_code)
+    flask_response = make_response(body, locals().get("response_status", response.status_code))
 
     excluded = {
         "content-length",
