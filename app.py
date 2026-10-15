@@ -33,9 +33,8 @@ def render_with_playwright(target_url):
     context = browser.new_context(java_script_enabled=True)
     try:
         page = context.new_page()
-        page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(1200)
-        return page.content(), page.url
+        response = page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+        return page.content(), page.url, (response.status if response else 200)
     finally:
         context.close()
 
@@ -157,6 +156,22 @@ def rewrite_html(html, target_origin):
 def proxy_request(target):
     parsed = urlparse(target)
     target_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Browser navigation is already the HTML fetch. Do not fetch the same
+    # document once with HTTPX and then a second time with Chromium.
+    accepts_html = "text/html" in request.headers.get("Accept", "")
+    if request.method == "GET" and accepts_html:
+        try:
+            with browser_lock:
+                rendered_html, final_url, browser_status = render_with_playwright(target)
+            final_parsed = urlparse(final_url)
+            final_origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
+            html = rewrite_html(rendered_html, final_origin)
+            result = make_response(html.encode("utf-8"), browser_status)
+            result.headers["Content-Type"] = "text/html; charset=utf-8"
+            return result
+        except Exception as exc:
+            app.logger.warning("Playwright navigation failed for %s; falling back to HTTPX: %s", target, exc)
 
     headers = {
         key: value
