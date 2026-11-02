@@ -360,17 +360,7 @@ def proxy_absolute_url():
     if not target_url:
         return "آدرس مقصد معتبر نیست.", 400
 
-    response = proxy_request(target_url)
-    parsed = urlparse(target_url)
-    response.set_cookie(
-        "vpn_target",
-        f"{parsed.scheme}://{parsed.netloc}",
-        max_age=86400,
-        httponly=True,
-        samesite="Lax",
-        path="/",
-    )
-    return response
+    return proxy_request(target_url)
 
 
 @app.route(
