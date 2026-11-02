@@ -129,7 +129,7 @@ def rewrite_url(value, current_url):
 def rewrite_html(html, current_url):
     # Rewrite URL-bearing attributes, including single-quoted and unquoted values.
     url_attributes = (
-        "href", "src", "action", "formaction", "poster", "data"
+        "href", "src", "srcset", "action", "formaction", "poster", "data"
     )
     attribute_pattern = (
         r'(\b(?:' + "|".join(url_attributes) + r')\s*=\s*)'
@@ -141,7 +141,16 @@ def rewrite_html(html, current_url):
         value = match.group(2) if match.group(2) is not None else (
             match.group(3) if match.group(3) is not None else match.group(4)
         )
-        rewritten = rewrite_url(value, current_url)
+        if prefix.strip().lower().startswith("srcset"):
+            # srcset contains multiple URL + descriptor candidates.
+            rewritten = re.sub(
+                r'(?<![\\w:])((?:https?:)?//[^,\\s]+|/(?!/)[^,\\s]+|\\.{1,2}/[^,\\s]+)',
+                lambda item: rewrite_url(item.group(1), current_url),
+                value,
+                flags=re.IGNORECASE,
+            )
+        else:
+            rewritten = rewrite_url(value, current_url)
         quote_char = '"' if match.group(2) is not None else (
             "'" if match.group(3) is not None else ""
         )
@@ -290,6 +299,10 @@ def proxy_request(target):
     excluded = {
         "content-length", "content-encoding", "transfer-encoding",
         "connection", "content-type", "location", "set-cookie",
+        # These policies refer to the upstream origin. They can block resources
+        # after the page has been moved onto the proxy origin.
+        "content-security-policy", "content-security-policy-report-only",
+        "x-content-security-policy", "x-webkit-csp",
     }
     for key, value in response.headers.items():
         if key.lower() not in excluded:
