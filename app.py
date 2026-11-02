@@ -144,7 +144,7 @@ def rewrite_html(html, current_url):
         if prefix.strip().lower().startswith("srcset"):
             # srcset contains multiple URL + descriptor candidates.
             rewritten = re.sub(
-                r'(?<![\\w:])((?:https?:)?//[^,\\s]+|/(?!/)[^,\\s]+|\\.{1,2}/[^,\\s]+)',
+                r'(?<![\w:])((?:https?:)?//[^,\s]+|/(?!/)[^,\s]+|\.{1,2}/[^,\s]+)',
                 lambda item: rewrite_url(item.group(1), current_url),
                 value,
                 flags=re.IGNORECASE,
