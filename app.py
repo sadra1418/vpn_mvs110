@@ -1,9 +1,9 @@
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, urlparse, quote, unquote
 import re
+from threading import RLock
 
 import httpx
 from flask import Flask, make_response, redirect, request
-
 from config import PORT, TARGET_URL
 from playwright.sync_api import sync_playwright
 
@@ -12,7 +12,6 @@ app = Flask(__name__)
 # Reuse one Chromium process; browser operations are serialized for safety.
 playwright_instance = None
 browser_instance = None
-from threading import RLock
 browser_lock = RLock()
 
 
@@ -34,7 +33,6 @@ def render_with_playwright(target_url):
     try:
         page = context.new_page()
         response = page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
-        # Only wait for client-side content when the initial DOM is nearly empty.
         try:
             initial_text = (page.locator("body").inner_text(timeout=1000) or "").strip()
         except Exception:
@@ -50,11 +48,6 @@ def render_with_playwright(target_url):
         return page.content(), page.url, (response.status if response else 200)
     finally:
         context.close()
-
-
-parsed_target = urlparse(TARGET_URL)
-TARGET_ORIGIN = f"{parsed_target.scheme}://{parsed_target.netloc}"
-TARGET_HOST = parsed_target.netloc
 
 
 HOME_PAGE = """<!doctype html>
@@ -99,62 +92,82 @@ HOME_PAGE = """<!doctype html>
 
 
 def validate_url(value):
-    parsed = urlparse(value.strip())
-
+    parsed = urlparse((value or "").strip())
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return None
+    return (value or "").strip()
 
-    return value.strip().rstrip("/")
+
+def proxy_url(target):
+    """Create a local proxy URL for an absolute upstream URL."""
+    parsed = urlparse(target)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return target
+    # Fragments are browser-side only; keep them after the proxy URL.
+    fragment = ("#" + parsed.fragment) if parsed.fragment else ""
+    upstream = parsed._replace(fragment="").geturl()
+    return "/proxy?url=" + quote(upstream, safe="") + fragment
 
 
-def rewrite_url(value, target_origin):
+def rewrite_url(value, current_url):
+    """Rewrite an HTML/CSS URL so the browser requests it through this proxy."""
     if not value:
         return value
 
     value = value.strip()
-
-    if value.startswith(("#", "data:", "javascript:", "mailto:", "tel:")):
+    if value.startswith(("#", "data:", "javascript:", "mailto:", "tel:", "blob:")):
         return value
 
-    absolute = urljoin(target_origin + "/", value)
+    absolute = urljoin(current_url, value)
     parsed = urlparse(absolute)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return value
 
-    if parsed.netloc == urlparse(target_origin).netloc:
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query
-        if parsed.fragment:
-            path += "#" + parsed.fragment
-        return path
-
-    return value
+    return proxy_url(absolute)
 
 
-def rewrite_html(html, target_origin):
+def rewrite_html(html, current_url):
+    # Rewrite URL-bearing attributes, including single-quoted and unquoted values.
+    url_attributes = (
+        "href", "src", "action", "formaction", "poster", "data"
+    )
+    attribute_pattern = (
+        r'(\b(?:' + "|".join(url_attributes) + r')\s*=\s*)'
+        r'(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))'
+    )
+
     def replace_attribute(match):
         prefix = match.group(1)
-        value = match.group(2)
-        return prefix + rewrite_url(value, target_origin) + '"'
+        value = match.group(2) if match.group(2) is not None else (
+            match.group(3) if match.group(3) is not None else match.group(4)
+        )
+        rewritten = rewrite_url(value, current_url)
+        quote_char = '"' if match.group(2) is not None else (
+            "'" if match.group(3) is not None else ""
+        )
+        return prefix + quote_char + rewritten + quote_char
 
-    html = re.sub(
-        r'((?:href|src|action)\s*=\s*")([^"]*)"',
-        replace_attribute,
-        html,
-        flags=re.IGNORECASE,
-    )
+    html = re.sub(attribute_pattern, replace_attribute, html, flags=re.IGNORECASE)
 
+    # Rewrite CSS resources relative to the stylesheet/document that declared them.
     def replace_css(match):
-        value = match.group(1).strip().strip("'").strip('"')
-        return "url(" + rewrite_url(value, target_origin) + ")"
+        raw_value = match.group(1).strip()
+        quote_char = raw_value[0] if raw_value.startswith(("'", '"')) else ""
+        value = raw_value.strip("'").strip('"')
+        rewritten = rewrite_url(value, current_url)
+        return "url(" + quote_char + rewritten + quote_char + ")"
 
-    html = re.sub(
-        r'url\(([^)]*)\)',
-        replace_css,
-        html,
-        flags=re.IGNORECASE,
-    )
+    html = re.sub(r"url\(([^)]*)\)", replace_css, html, flags=re.IGNORECASE)
 
-    if "<head" in html.lower() and "<base " not in html.lower():
+    # Keep browser-generated relative requests on this host. The catch-all route
+    # forwards them to the selected target origin.
+    if "<head" in html.lower():
+        html = re.sub(
+            r"<base\b[^>]*>",
+            "",
+            html,
+            flags=re.IGNORECASE,
+        )
         html = re.sub(
             r"(<head[^>]*>)",
             r'\1<base href="/">',
@@ -169,33 +182,51 @@ def rewrite_html(html, target_origin):
 def needs_browser_render(html):
     """Detect an almost-empty JavaScript application shell."""
     lowered = html.lower()
-    markers = ('id="root"', "id='root'", 'id="app"', "id='app'",
-               'id="__next"', "id='__next'", 'id="svelte"', "id='svelte'",
-               "data-reactroot")
+    markers = (
+        'id="root"', "id='root'", 'id="app"', "id='app'",
+        'id="__next"', "id='__next'", 'id="svelte"', "id='svelte'",
+        "data-reactroot",
+    )
     if not any(marker in lowered for marker in markers):
         return False
-    visible = re.sub(r"<(script|style|noscript)\b[^>]*>.*?</\1>", " ", html,
-                     flags=re.IGNORECASE | re.DOTALL)
+    visible = re.sub(
+        r"<(script|style|noscript)\b[^>]*>.*?</\1>",
+        " ",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     visible = re.sub(r"<[^>]+>", " ", visible)
-    visible = re.sub(r"&(?:nbsp|amp|lt|gt|quot);", " ", visible, flags=re.IGNORECASE)
+    visible = re.sub(
+        r"&(?:nbsp|amp|lt|gt|quot);",
+        " ",
+        visible,
+        flags=re.IGNORECASE,
+    )
     visible = re.sub(r"\s+", " ", visible).strip()
     return len(visible) < 350
 
 
 def proxy_request(target):
     parsed = urlparse(target)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return make_response("Invalid target URL", 400)
+
     target_origin = f"{parsed.scheme}://{parsed.netloc}"
 
     headers = {
         key: value
         for key, value in request.headers
         if key.lower() not in {
-            "host",
-            "content-length",
-            "connection",
-            "accept-encoding",
+            "host", "content-length", "connection", "accept-encoding",
+            "cookie", "origin", "referer",
         }
     }
+
+    # Origin and Referer must describe the upstream site, not this proxy.
+    if request.headers.get("Origin"):
+        headers["Origin"] = target_origin
+    if request.headers.get("Referer"):
+        headers["Referer"] = target
 
     forwarded_cookies = request.cookies.to_dict()
     forwarded_cookies.pop("vpn_target", None)
@@ -205,10 +236,7 @@ def proxy_request(target):
             follow_redirects=False,
             timeout=120,
             headers={
-                "User-Agent": request.headers.get(
-                    "User-Agent",
-                    "Mozilla/5.0",
-                ),
+                "User-Agent": request.headers.get("User-Agent", "Mozilla/5.0"),
                 **headers,
             },
         ) as client:
@@ -216,7 +244,6 @@ def proxy_request(target):
                 request.method,
                 target,
                 content=request.get_data(),
-                params=None,
                 cookies=forwarded_cookies,
             )
     except Exception as exc:
@@ -224,68 +251,62 @@ def proxy_request(target):
 
     content_type = response.headers.get("content-type", "")
     body = response.content
+    response_status = response.status_code
 
-    if "text/html" in content_type and request.method == "GET":
+    if "text/html" in content_type:
         original_html = response.text
-        response_status = response.status_code
-        if needs_browser_render(original_html):
+        if request.method == "GET" and needs_browser_render(original_html):
             try:
                 with browser_lock:
                     rendered_html, final_url, browser_status = render_with_playwright(target)
-                final_parsed = urlparse(final_url)
-                final_origin = f"{final_parsed.scheme}://{final_parsed.netloc}"
                 response_status = browser_status
-                text = rewrite_html(rendered_html, final_origin)
-                body = text.encode("utf-8")
+                body = rewrite_html(rendered_html, final_url).encode("utf-8")
             except Exception as exc:
-                text = rewrite_html(original_html, target_origin)
-                body = text.encode(response.encoding or "utf-8")
-                app.logger.warning("Playwright rendering failed for %s: %s", target, exc)
+                body = rewrite_html(original_html, target).encode(
+                    response.encoding or "utf-8"
+                )
+                app.logger.warning(
+                    "Playwright rendering failed for %s: %s", target, exc
+                )
         else:
-            text = rewrite_html(original_html, target_origin)
-            body = text.encode(response.encoding or "utf-8")
-    elif "text/html" in content_type:
-        text = rewrite_html(response.text, target_origin)
-        body = text.encode(response.encoding or "utf-8")
+            body = rewrite_html(original_html, target).encode(
+                response.encoding or "utf-8"
+            )
 
     elif "text/css" in content_type:
         text = response.text
         text = re.sub(
-            r'url\(([^)]*)\)',
+            r"url\(([^)]*)\)",
             lambda match: "url(" + rewrite_url(
-                match.group(1).strip().strip("'").strip('"'),
-                target_origin,
+                match.group(1).strip().strip("'").strip('"'), target
             ) + ")",
             text,
             flags=re.IGNORECASE,
         )
         body = text.encode(response.encoding or "utf-8")
 
-    flask_response = make_response(body, locals().get("response_status", response.status_code))
+    flask_response = make_response(body, response_status)
 
     excluded = {
-        "content-length",
-        "content-encoding",
-        "transfer-encoding",
-        "connection",
-        "content-type",
+        "content-length", "content-encoding", "transfer-encoding",
+        "connection", "content-type", "location", "set-cookie",
     }
-
     for key, value in response.headers.items():
-        if key.lower() not in excluded and key.lower() != "location":
+        if key.lower() not in excluded:
             flask_response.headers[key] = value
 
     if content_type:
         flask_response.headers["Content-Type"] = content_type
 
+    # Redirects must be resolved against the actual upstream URL.
     location = response.headers.get("location")
     if location:
-        flask_response.headers["Location"] = rewrite_url(
-            location,
-            target_origin,
-        )
+        flask_response.headers["Location"] = rewrite_url(location, target)
 
+    # Preserve upstream cookies, but remove Domain so the browser stores them
+    # for the proxy host and sends them back on subsequent proxied requests.
     for cookie in response.headers.get_list("set-cookie"):
+        cookie = re.sub(r";\s*domain=[^;]+", "", cookie, flags=re.IGNORECASE)
         flask_response.headers.add("Set-Cookie", cookie)
 
     return flask_response
@@ -295,14 +316,15 @@ def proxy_request(target):
 def index():
     if request.method == "POST":
         target_url = validate_url(request.form.get("target_url", ""))
-
         if not target_url:
             return "آدرس واردشده معتبر نیست.", 400
 
-        response = redirect("/url?url=" + quote(target_url, safe=""))
+        response = redirect("/proxy?url=" + quote(target_url, safe=""))
+        parsed = urlparse(target_url)
+        target_origin = f"{parsed.scheme}://{parsed.netloc}"
         response.set_cookie(
             "vpn_target",
-            target_url,
+            target_origin,
             max_age=86400,
             httponly=True,
             samesite="Lax",
@@ -316,30 +338,57 @@ def index():
 @app.route("/url")
 def open_url():
     target_url = validate_url(request.args.get("url", ""))
-
     if not target_url:
         return "آدرس واردشده معتبر نیست.", 400
 
-    return proxy_request(target_url)
+    response = proxy_request(target_url)
+    parsed = urlparse(target_url)
+    response.set_cookie(
+        "vpn_target",
+        f"{parsed.scheme}://{parsed.netloc}",
+        max_age=86400,
+        httponly=True,
+        samesite="Lax",
+        path="/",
+    )
+    return response
 
 
-@app.route("/<path:path>")
+@app.route("/proxy", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+def proxy_absolute_url():
+    target_url = validate_url(request.args.get("url", ""))
+    if not target_url:
+        return "آدرس مقصد معتبر نیست.", 400
+
+    response = proxy_request(target_url)
+    parsed = urlparse(target_url)
+    response.set_cookie(
+        "vpn_target",
+        f"{parsed.scheme}://{parsed.netloc}",
+        max_age=86400,
+        httponly=True,
+        samesite="Lax",
+        path="/",
+    )
+    return response
+
+
+@app.route(
+    "/<path:path>",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
 def proxy_path(path):
-    target_url = request.cookies.get("vpn_target")
-
-    if not target_url:
+    target_origin = request.cookies.get("vpn_target")
+    if not target_origin:
         return redirect("/")
 
-    target_url = validate_url(target_url)
-
-    if not target_url:
+    target_origin = validate_url(target_origin)
+    if not target_origin:
         return redirect("/")
 
-    base = target_url + "/"
-    target = urljoin(base, path)
-
+    target = urljoin(target_origin.rstrip("/") + "/", path)
     if request.query_string:
-        target += "?" + request.query_string.decode()
+        target += "?" + request.query_string.decode("utf-8", errors="replace")
 
     return proxy_request(target)
 
