@@ -326,8 +326,12 @@ def rewrite_html(text, current_url, origin):
 
     def replace(match):
         if match.group("sattrs") is not None:
-            attrs = rewrite_attrs("script", match.group("sattrs"), base_url, origin)
-            return "<script" + attrs + ">" + match.group("sbody") + "</script>"
+            raw_attrs = match.group("sattrs")
+            attrs = rewrite_attrs("script", raw_attrs, base_url, origin)
+            script_body = match.group("sbody")
+            if is_js_script(raw_attrs):
+                script_body = rewrite_js(script_body)
+            return "<script" + attrs + ">" + script_body + "</script>"
 
         if match.group("tattrs") is not None:
             attrs = rewrite_attrs("style", match.group("tattrs"), base_url, origin)
@@ -350,6 +354,60 @@ def rewrite_html(text, current_url, origin):
 
 
 # --------------------------------------------------------------------------
+# JavaScript navigation
+# --------------------------------------------------------------------------
+# `location` cannot be overridden in a browser, so `location.href = url`,
+# `location.assign(url)` and `location.replace(url)` would leave the proxy for
+# the real (possibly blocked) site. Those three forms are rewritten to go
+# through __vpnW(), which maps the URL first. __vpnW() hands every object that
+# is not a real Location back untouched, so a local variable that happens to be
+# named `location` keeps working. The replacement starts with an identifier on
+# purpose: a leading "(" or ";" would change how code without semicolons parses.
+
+JS_TYPES = (
+    "application/javascript", "text/javascript", "application/x-javascript",
+    "application/ecmascript", "text/ecmascript",
+)
+MAX_JS_REWRITE_BYTES = 8 * 1024 * 1024
+_WINDOW_NAMES = r"(?:window|self|top|parent|document|globalThis|frames)"
+LOCATION_CALL_RE = re.compile(
+    r"(?<![\w$.])(?P<loc>(?:" + _WINDOW_NAMES + r"\s*\.\s*)*location)"
+    r"(?P<tail>\s*\.\s*(?:(?:assign|replace)\s*\(|href\s*=(?!=)))"
+)
+# `window.location = url` (a bare `location = url` may be a local variable)
+LOCATION_SET_RE = re.compile(
+    r"(?<![\w$.])(?P<loc>(?:" + _WINDOW_NAMES + r"\s*\.\s*)+location)"
+    r"\s*=(?!=)"
+)
+SCRIPT_TYPE_RE = re.compile(
+    r"""\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.IGNORECASE
+)
+
+
+def _wrapped_location(loc):
+    return "Object(self.__vpnW?self.__vpnW(%s):%s)" % (loc, loc)
+
+
+def rewrite_js(code):
+    if "location" not in code:
+        return code
+    code = LOCATION_CALL_RE.sub(
+        lambda m: _wrapped_location(m.group("loc")) + m.group("tail"), code
+    )
+    return LOCATION_SET_RE.sub(
+        lambda m: _wrapped_location(m.group("loc")) + ".href=", code
+    )
+
+
+def is_js_script(attrs):
+    match = SCRIPT_TYPE_RE.search(attrs)
+    if not match:
+        return True
+    value = next(g for g in match.groups() if g is not None).strip().lower()
+    return value in ("", "module") or "javascript" in value or "ecmascript" in value
+
+
+# --------------------------------------------------------------------------
 # Script and widget injected into proxied pages
 # --------------------------------------------------------------------------
 
@@ -358,6 +416,7 @@ CLIENT_SCRIPT = r"""
   if (window.__vpnPatched) { return; }
   window.__vpnPatched = true;
   var SESSION_ORIGIN = __VPN_ORIGIN__;
+  var DOC_HOST = __VPN_DOCHOST__;
   var HOST = location.origin;
   var SKIP = /^(?:data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
 
@@ -378,6 +437,102 @@ CLIENT_SCRIPT = r"""
       return "/proxy?url=" + encodeURIComponent(u.href) + hash;
     } catch (e) { return input; }
   }
+
+  // Target of the server-side rewrite of `location.href = x`, `.assign()`
+  // and `.replace()`: send the navigation through the proxy.
+  window.__vpnW = function (obj) {
+    try {
+      if (Object.prototype.toString.call(obj) !== "[object Location]") { return obj; }
+    } catch (e) { return obj; }
+    return {
+      assign: function (u) { return obj.assign(px(u)); },
+      replace: function (u) { return obj.replace(px(u)); },
+      get href() { return obj.href; },
+      set href(u) { obj.href = px(u); }
+    };
+  };
+
+  // Cookies are stored per site as "vpn~<domain>~<name>" (see the server).
+  // Scripts keep seeing and writing the plain names of their own site.
+  function inScope(scope) {
+    return DOC_HOST === scope || DOC_HOST.slice(-(scope.length + 1)) === "." + scope;
+  }
+  try {
+    var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, "cookie");
+    if (DOC_HOST && cookieDesc && cookieDesc.get && cookieDesc.set && cookieDesc.configurable) {
+      Object.defineProperty(Document.prototype, "cookie", {
+        configurable: true,
+        enumerable: cookieDesc.enumerable,
+        get: function () {
+          var out = [];
+          cookieDesc.get.call(this).split(/;\s*/).forEach(function (part) {
+            var m = /^vpn~([^~=]+)~([^=]*)(=.*)?$/.exec(part);
+            if (m && inScope(m[1])) { out.push(m[2] + (m[3] || "")); }
+          });
+          return out.join("; ");
+        },
+        set: function (text) {
+          var parts = String(text).split(";");
+          var first = parts.shift();
+          var eq = first.indexOf("=");
+          var name = (eq < 0 ? "" : first.slice(0, eq)).trim();
+          var value = eq < 0 ? first : first.slice(eq);
+          if (!name) { name = first.trim(); value = ""; }
+          var scope = DOC_HOST, extra = "";
+          for (var i = 0; i < parts.length; i++) {
+            var kv = parts[i].split("=");
+            var key = kv[0].trim().toLowerCase();
+            if (key === "domain") {
+              var d = (kv[1] || "").trim().replace(/^\./, "").toLowerCase();
+              if (!d || !inScope(d)) { return; }
+              scope = d;
+            } else if (key === "expires" || key === "max-age") {
+              extra += "; " + parts[i].trim();
+            } else if (key === "secure" && location.protocol === "https:") {
+              extra += "; Secure";
+            }
+          }
+          cookieDesc.set.call(this, "vpn~" + scope + "~" + name + value + "; Path=/" + extra);
+        }
+      });
+    }
+  } catch (e) {}
+
+  // Subresource Integrity hashes cannot match the rewritten files.
+  ["HTMLScriptElement", "HTMLLinkElement"].forEach(function (ctor) {
+    try {
+      var proto = window[ctor].prototype;
+      var d = Object.getOwnPropertyDescriptor(proto, "integrity");
+      if (d && d.configurable) {
+        Object.defineProperty(proto, "integrity", {
+          configurable: true, enumerable: d.enumerable, get: d.get, set: function () {}
+        });
+      }
+    } catch (e) {}
+  });
+
+  // Links and forms built from strings (innerHTML, template engines) were
+  // never rewritten by the server: fix them at the moment they are used.
+  function fixAttr(el, attr) {
+    try {
+      var raw = el.getAttribute(attr);
+      if (!raw) { return; }
+      var fixed = px(raw);
+      if (fixed !== raw) { nativeSetAttribute.call(el, attr, fixed); }
+    } catch (e) {}
+  }
+  document.addEventListener("click", function (event) {
+    var node = event.target;
+    var link = node && node.closest ? node.closest("a[href], area[href]") : null;
+    if (link) { fixAttr(link, "href"); }
+  }, true);
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (form && form.getAttribute) { fixAttr(form, "action"); }
+    if (event.submitter && event.submitter.getAttribute) {
+      fixAttr(event.submitter, "formaction");
+    }
+  }, true);
 
   if (window.fetch) {
     var nativeFetch = window.fetch;
@@ -428,6 +583,7 @@ CLIENT_SCRIPT = r"""
   Element.prototype.setAttribute = function (name, value) {
     try {
       var key = String(name).toLowerCase();
+      if (key === "integrity") { return; }
       if (URL_ATTRS[key] === 1 && typeof value === "string" &&
           this.tagName !== "BASE" && (key !== "data" || this.tagName === "OBJECT")) {
         value = px(value);
@@ -533,10 +689,12 @@ HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
 DOCTYPE_RE = re.compile(r"<!doctype[^>]*>", re.IGNORECASE)
 
 
-def inject(text, origin, with_script, with_widget):
+def inject(text, origin, doc_host, with_script, with_widget):
     if with_script:
         script = "<script>" + CLIENT_SCRIPT.replace(
             "__VPN_ORIGIN__", json.dumps(origin).replace("</", "<\\/")
+        ).replace(
+            "__VPN_DOCHOST__", json.dumps(doc_host).replace("</", "<\\/")
         ) + "</script>"
         for pattern in (HEAD_OPEN_RE, HTML_OPEN_RE, DOCTYPE_RE):
             match = pattern.search(text)
@@ -773,15 +931,11 @@ def upstream_headers(target):
     if referer:
         headers["Referer"] = referer
 
-    # Forward the visitor's cookies, minus our own session marker.
-    cookies = [
-        part.strip()
-        for part in request.headers.get("Cookie", "").split(";")
-        if part.strip()
-        and part.split("=", 1)[0].strip() != SESSION_COOKIE
-    ]
-    if cookies:
-        headers["Cookie"] = "; ".join(cookies)
+    # Every site shares this proxy's origin, so each upstream cookie is stored
+    # under a per-site name. Only the ones that belong to this host go upstream.
+    cookie_header = upstream_cookie_header(urlsplit(target).hostname or "")
+    if cookie_header:
+        headers["Cookie"] = cookie_header
 
     # HTML/CSS are decoded and rewritten here. Ranges only make sense on the
     # untouched bytes, so ask for identity encoding in that case.
@@ -792,20 +946,59 @@ def upstream_headers(target):
     return headers
 
 
-def rewrite_set_cookie(cookie):
+# A cookie "sid" set by accounts.google.com for Domain=google.com is stored in
+# the browser as "vpn~google.com~sid". The same format is produced and parsed
+# by the injected document.cookie wrapper (see CLIENT_SCRIPT).
+COOKIE_PREFIX = "vpn~"
+
+
+def host_in_scope(host, scope):
+    return host == scope or host.endswith("." + scope)
+
+
+def upstream_cookie_header(host):
+    host = host.lower()
+    selected = []
+    for part in request.headers.get("Cookie", "").split(";"):
+        part = part.strip()
+        if not part.startswith(COOKIE_PREFIX):
+            continue
+        scope, sep, rest = part[len(COOKIE_PREFIX):].partition("~")
+        if sep and rest and host_in_scope(host, scope):
+            selected.append(rest)
+    return "; ".join(selected)
+
+
+def rewrite_set_cookie(cookie, host):
+    """Namespace an upstream Set-Cookie per site; None when it must be dropped."""
     parts = [part.strip() for part in cookie.split(";")]
+    name, sep, value = parts[0].partition("=")
+    name = name.strip()
+    if not name or not sep:
+        return None
+
+    host = host.lower()
+    scope = host
     attributes = []
     for part in parts[1:]:
-        key, _, value = part.partition("=")
+        key, _, attr_value = part.partition("=")
         key = key.strip().lower()
-        if key in ("domain", "partitioned"):
-            continue
-        if key == "secure" and not request.is_secure:
-            continue
-        if key == "samesite" and value.strip().lower() == "none":
-            part = "SameSite=None" if request.is_secure else "SameSite=Lax"
-        attributes.append(part)
-    return "; ".join([parts[0]] + attributes)
+        if key == "domain":
+            domain = attr_value.strip().lstrip(".").lower()
+            if not domain or not host_in_scope(host, domain):
+                return None  # browsers reject cookies for foreign domains
+            scope = domain
+        elif key in ("expires", "max-age"):
+            attributes.append(part)
+        elif key == "httponly":
+            attributes.append("HttpOnly")
+        elif key == "secure" and request.is_secure:
+            attributes.append("Secure")
+        # Path, SameSite, Partitioned, Priority are dropped: every request is
+        # same-site for the browser and paths are not meaningful here.
+    return "; ".join(
+        [COOKIE_PREFIX + scope + "~" + name + "=" + value, "Path=/"] + attributes
+    )
 
 
 def decode_body(body, declared, sniff_html):
@@ -848,10 +1041,11 @@ def apply_headers(upstream, response, target, origin, modified):
             if match else refresh
         )
 
+    host = urlsplit(target).hostname or ""
     for cookie in upstream.headers.get_list("set-cookie"):
-        if cookie.split("=", 1)[0].strip() == SESSION_COOKIE:
-            continue
-        response.headers.add("Set-Cookie", rewrite_set_cookie(cookie))
+        rewritten = rewrite_set_cookie(cookie, host)
+        if rewritten:
+            response.headers.add("Set-Cookie", rewritten)
 
 
 def stream_body(upstream):
@@ -899,7 +1093,15 @@ def proxy_request(target, origin=None):
     media_type = content_type.split(";", 1)[0].strip().lower()
     has_body = request.method != "HEAD" and status not in (204, 304)
 
-    if has_body and (media_type in HTML_TYPES or media_type == "text/css"):
+    is_script = (
+        media_type in JS_TYPES
+        and request.headers.get("Sec-Fetch-Dest") not in (
+            "worker", "sharedworker", "serviceworker"
+        )
+        and (upstream.headers.get("content-length") or "0").isdigit()
+        and int(upstream.headers.get("content-length") or 0) <= MAX_JS_REWRITE_BYTES
+    )
+    if has_body and (media_type in HTML_TYPES or media_type == "text/css" or is_script):
         try:
             raw = upstream.read()
         except Exception as exc:
@@ -916,10 +1118,14 @@ def proxy_request(target, origin=None):
             text = inject(
                 text,
                 origin or "",
+                urlsplit(target).hostname or "",
                 with_script=kind in ("document", "iframe", "frame"),
                 with_widget=kind == "document",
             )
             out_type = "text/html; charset=utf-8"
+        elif is_script:
+            text = rewrite_js(text)
+            out_type = media_type + "; charset=utf-8"
         else:
             text = rewrite_css(text, target, origin)
             out_type = "text/css; charset=utf-8"
