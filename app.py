@@ -1,9 +1,12 @@
+import gzip
+import hashlib
 import html as html_lib
 import ipaddress
 import json
 import re
 import socket
 import time
+from functools import lru_cache
 from http.cookiejar import DefaultCookiePolicy
 from urllib.parse import parse_qs, quote, unquote, urldefrag, urljoin, urlsplit
 
@@ -33,47 +36,128 @@ SESSION_COOKIE = "vpn_target"
 SESSION_MAX_AGE = 7 * 24 * 3600
 ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 
-HOME_PAGE = """<!doctype html>
+HOME_PAGE = r"""<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
     <title>اتصال به سایت</title>
     <style>
+        :root {
+            --bg: #f6f7f9; --card: #fff; --text: #14161a; --muted: #667085;
+            --line: #e2e5ea; --accent: #2563eb; --accent-text: #fff;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0e1013; --card: #171a1f; --text: #eceff4; --muted: #9aa3b2;
+                --line: #2a2f37; --accent: #4c8dff; --accent-text: #06101f;
+            }
+        }
+        * { box-sizing: border-box; }
         body {
-            font-family: sans-serif;
-            max-width: 700px;
-            margin: 80px auto;
-            padding: 20px;
+            margin: 0; min-height: 100vh; display: grid; place-items: center;
+            padding: 20px; background: var(--bg); color: var(--text);
+            font: 16px/1.6 system-ui, "Segoe UI", Tahoma, sans-serif;
         }
+        main {
+            width: 100%; max-width: 640px; background: var(--card);
+            border: 1px solid var(--line); border-radius: 16px; padding: 28px;
+        }
+        h1 { margin: 0 0 18px; font-size: 1.25rem; }
+        form { display: flex; gap: 10px; }
         input {
-            width: 100%;
-            box-sizing: border-box;
-            padding: 12px;
-            margin: 10px 0;
-            direction: ltr;
+            flex: 1; min-width: 0; direction: ltr; text-align: left;
+            padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px;
+            background: transparent; color: inherit; font: inherit;
         }
+        input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
         button {
-            padding: 12px 24px;
-            cursor: pointer;
+            padding: 12px 22px; border: 0; border-radius: 10px;
+            background: var(--accent); color: var(--accent-text);
+            font: inherit; font-weight: 600; cursor: pointer;
         }
+        button:disabled { opacity: .6; cursor: wait; }
+        #recent { margin-top: 22px; }
+        #recent h2 { margin: 0 0 8px; font-size: .85rem; color: var(--muted); font-weight: 500; }
+        #recent ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+        #recent button {
+            padding: 6px 12px; background: transparent; color: inherit;
+            border: 1px solid var(--line); font-weight: 400; direction: ltr;
+        }
+        @media (max-width: 480px) { form { flex-direction: column; } }
     </style>
 </head>
 <body>
-    <h1>آدرس سایت مقصد را وارد کنید</h1>
-    <form method="post" action="/__connect">
-        <input
-            name="target_url"
-            type="text"
-            inputmode="url"
-            autocomplete="url"
-            autocapitalize="none"
-            spellcheck="false"
-            placeholder="https://example.com"
-            required
-        >
-        <button type="submit">اتصال</button>
-    </form>
+    <main>
+        <h1>آدرس سایت مقصد را وارد کنید</h1>
+        <form id="f" method="post" action="/__connect">
+            <input
+                name="target_url"
+                type="text"
+                inputmode="url"
+                autocomplete="url"
+                autocapitalize="none"
+                spellcheck="false"
+                placeholder="example.com"
+                required
+                autofocus
+            >
+            <button type="submit">اتصال</button>
+        </form>
+        <section id="recent" hidden>
+            <h2>اخیراً باز شده</h2>
+            <ul id="list"></ul>
+        </section>
+    </main>
+    <script>
+    (function () {
+        var KEY = "vpn_recent";
+        var form = document.getElementById("f");
+        var input = form.elements.target_url;
+        var submit = form.querySelector("button[type=submit]");
+        var box = document.getElementById("recent");
+        var list = document.getElementById("list");
+
+        function load() {
+            try {
+                var items = JSON.parse(localStorage.getItem(KEY) || "[]");
+                return items.filter(function (v) { return typeof v === "string"; }).slice(0, 6);
+            } catch (e) { return []; }
+        }
+        function save(items) {
+            try { localStorage.setItem(KEY, JSON.stringify(items.slice(0, 6))); } catch (e) {}
+        }
+        function render() {
+            var items = load();
+            box.hidden = !items.length;
+            list.textContent = "";
+            items.forEach(function (url) {
+                var li = document.createElement("li");
+                var b = document.createElement("button");
+                b.type = "button";
+                b.textContent = url.replace(/^https?:\/\//, "");
+                b.addEventListener("click", function () {
+                    input.value = url;
+                    if (form.requestSubmit) { form.requestSubmit(); } else { form.submit(); }
+                });
+                li.appendChild(b);
+                list.appendChild(li);
+            });
+        }
+
+        form.addEventListener("submit", function () {
+            var value = input.value.trim();
+            if (!value) { return; }
+            if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) { value = "https://" + value; }
+            save([value].concat(load().filter(function (v) { return v !== value; })));
+            submit.disabled = true;
+        });
+        // Coming back with the browser's back button must not leave it disabled.
+        window.addEventListener("pageshow", function () { submit.disabled = false; render(); });
+        render();
+    })();
+    </script>
 </body>
 </html>
 """
@@ -166,14 +250,32 @@ def rewrite_url(value, base_url, origin):
         or "<%" in stripped
     ):
         return value
+    rewritten = _rewrite_cached(stripped, base_url, origin)
+    return value if rewritten is None else rewritten
+
+
+@lru_cache(maxsize=16384)
+def _rewrite_cached(stripped, base_url, origin):
+    """Menus, icons and scripts repeat on every page, so results are cached
+    across requests. None means "leave the value as it is"."""
     try:
-        absolute = urljoin(base_url, stripped)
+        if (
+            stripped[0] == "/"
+            and stripped[1:2] != "/"
+            and "/." not in stripped
+            and stripped.isprintable()
+        ):
+            # "/path" cannot be affected by dot segments: skip urljoin().
+            base = urlsplit(base_url)
+            absolute = base.scheme + "://" + base.netloc + stripped
+        else:
+            absolute = urljoin(base_url, stripped)
         parts = urlsplit(absolute)
         if parts.scheme not in ("http", "https") or not parts.netloc:
-            return value
+            return None
         return to_proxy(absolute, origin)
     except ValueError:
-        return value
+        return None
 
 
 def rewrite_srcset(value, base_url, origin):
@@ -270,6 +372,9 @@ URL_ATTRS = {
     "data-src", "data-original", "data-lazy-src",
 }
 SRCSET_ATTRS = {"srcset", "data-srcset", "imagesrcset"}
+RELEVANT_ATTR_RE = re.compile(
+    r"href|src|action|poster|background|style|integrity|content|data", re.IGNORECASE
+)
 
 
 def rewrite_attrs(tag, attrs, base_url, origin):
@@ -346,6 +451,8 @@ def rewrite_html(text, current_url, origin):
             re.IGNORECASE,
         ):
             return ""
+        if not RELEVANT_ATTR_RE.search(attrs):
+            return match.group(0)  # <div class="x">: nothing to rewrite
         return "<" + match.group("tag") + rewrite_attrs(
             tag, attrs, base_url, origin
         ) + ">"
@@ -415,8 +522,9 @@ CLIENT_SCRIPT = r"""
 (function () {
   if (window.__vpnPatched) { return; }
   window.__vpnPatched = true;
-  var SESSION_ORIGIN = __VPN_ORIGIN__;
-  var DOC_HOST = __VPN_DOCHOST__;
+  var cfg = (document.currentScript && document.currentScript.dataset) || {};
+  var SESSION_ORIGIN = cfg.origin || "";
+  var DOC_HOST = cfg.host || "";
   var HOST = location.origin;
   var SKIP = /^(?:data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
 
@@ -648,69 +756,83 @@ CLIENT_SCRIPT = r"""
       location.href = px(target.href);
     } catch (e) {}
   }, true);
+
+  // Constructors that take a URL.
+  ["Worker", "SharedWorker"].forEach(function (name) {
+    var Native = window[name];
+    if (!Native) { return; }
+    var Wrapped = function (url, options) { return new Native(px(url), options); };
+    Wrapped.prototype = Native.prototype;
+    window[name] = Wrapped;
+  });
+  if (window.EventSource) {
+    var NativeES = window.EventSource;
+    var WrappedES = function (url, options) { return new NativeES(px(url), options); };
+    WrappedES.prototype = NativeES.prototype;
+    WrappedES.CONNECTING = 0; WrappedES.OPEN = 1; WrappedES.CLOSED = 2;
+    window.EventSource = WrappedES;
+  }
+
+  // Home/reload buttons. Built after the page has loaded and kept in a closed
+  // shadow root outside <body>: the site's CSS cannot restyle them and a
+  // framework that hydrates the page never meets an unexpected node.
+  function mountWidget() {
+    try {
+      if (window.top !== window || !document.documentElement) { return; }
+      var host = document.createElement("div");
+      host.style.cssText = "all:initial;position:fixed;right:18px;bottom:18px;z-index:2147483647";
+      var root = host.attachShadow({ mode: "closed" });
+      root.innerHTML =
+        "<style>" +
+        ".w{display:flex;gap:8px;font:14px/1 system-ui,sans-serif;direction:rtl}" +
+        "a,button{border:0;border-radius:10px;padding:10px 15px;background:#111;color:#fff;" +
+        "font:inherit;cursor:pointer;text-decoration:none;box-shadow:0 3px 12px rgba(0,0,0,.25)}" +
+        "a:active,button:active{transform:scale(.96)}" +
+        "</style>" +
+        '<div class="w"><a href="/__home">⌂ خانه</a>' +
+        '<button type="button">↻ ریلود</button></div>';
+      root.querySelector("button").addEventListener("click", function () { location.reload(); });
+      document.documentElement.appendChild(host);
+    } catch (e) {}
+  }
+  window.addEventListener("load", function () { setTimeout(mountWidget, 800); });
 })();
 """
 
-WIDGET = """
-<style id="vpn-widget-style">
-#vpn-widget {
-    position: fixed;
-    right: 18px;
-    bottom: 18px;
-    z-index: 2147483647;
-    display: flex;
-    gap: 8px;
-    font-family: sans-serif;
-}
-#vpn-widget button, #vpn-widget a {
-    border: 0;
-    border-radius: 10px;
-    padding: 10px 15px;
-    background: #111;
-    color: #fff;
-    font-size: 14px;
-    cursor: pointer;
-    text-decoration: none;
-    box-shadow: 0 3px 12px rgba(0,0,0,.25);
-}
-#vpn-widget button:active, #vpn-widget a:active {
-    transform: scale(.96);
-}
-</style>
-<div id="vpn-widget">
-    <a href="/__home">⌂ خانه</a>
-    <button id="vpn-reload-button" type="button"
-            onclick="window.location.reload()">↻ ریلود</button>
-</div>
-"""
+
+def minify_js(source):
+    """Drop indentation, blank lines and whole-line // comments."""
+    return "\n".join(
+        line.strip()
+        for line in source.splitlines()
+        if line.strip() and not line.strip().startswith("//")
+    )
+
+
+# Served once as a static, long-cached file instead of ~10 KB inline per page.
+CLIENT_JS = minify_js(CLIENT_SCRIPT)
+CLIENT_JS_PATH = (
+    "/__vpn/client." + hashlib.sha1(CLIENT_JS.encode("utf-8")).hexdigest()[:10] + ".js"
+)
 
 HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
 HTML_OPEN_RE = re.compile(r"<html\b[^>]*>", re.IGNORECASE)
 DOCTYPE_RE = re.compile(r"<!doctype[^>]*>", re.IGNORECASE)
 
 
-def inject(text, origin, doc_host, with_script, with_widget):
-    if with_script:
-        script = "<script>" + CLIENT_SCRIPT.replace(
-            "__VPN_ORIGIN__", json.dumps(origin).replace("</", "<\\/")
-        ).replace(
-            "__VPN_DOCHOST__", json.dumps(doc_host).replace("</", "<\\/")
-        ) + "</script>"
-        for pattern in (HEAD_OPEN_RE, HTML_OPEN_RE, DOCTYPE_RE):
-            match = pattern.search(text)
-            if match:
-                text = text[:match.end()] + script + text[match.end():]
-                break
-        else:
-            text = script + text
-
-    if with_widget:
-        index = text.lower().rfind("</body>")
-        if index == -1:
-            text += WIDGET
-        else:
-            text = text[:index] + WIDGET + text[index:]
-    return text
+def inject(text, origin, doc_host, with_script):
+    if not with_script:
+        return text
+    tag = '<script src="%s" data-origin="%s" data-host="%s"></script>' % (
+        CLIENT_JS_PATH,
+        html_lib.escape(origin, quote=True),
+        html_lib.escape(doc_host, quote=True),
+    )
+    for pattern in (HEAD_OPEN_RE, HTML_OPEN_RE, DOCTYPE_RE):
+        match = pattern.search(text)
+        if match:
+            return text[:match.end()] + tag + text[match.end():]
+    return tag + text
 
 
 # --------------------------------------------------------------------------
@@ -1001,6 +1123,29 @@ def rewrite_set_cookie(cookie, host):
     )
 
 
+def add_vary(response, *names):
+    current = [v.strip() for v in response.headers.get("Vary", "").split(",") if v.strip()]
+    lowered = {v.lower() for v in current}
+    for name in names:
+        if name.lower() not in lowered:
+            current.append(name)
+    response.headers["Vary"] = ", ".join(current)
+
+
+def maybe_gzip(response):
+    """Compress a rewritten body: the proxy decoded it, so the browser would
+    otherwise receive it uncompressed (a big cost on slow connections)."""
+    if "gzip" not in request.headers.get("Accept-Encoding", "").lower():
+        return response
+    data = response.get_data()
+    if len(data) < 1024 or response.headers.get("Content-Encoding"):
+        return response
+    response.set_data(gzip.compress(data, compresslevel=5, mtime=0))
+    response.headers["Content-Encoding"] = "gzip"
+    add_vary(response, "Accept-Encoding")
+    return response
+
+
 def decode_body(body, declared, sniff_html):
     candidates = []
     if body.startswith(b"\xef\xbb\xbf"):
@@ -1120,7 +1265,6 @@ def proxy_request(target, origin=None):
                 origin or "",
                 urlsplit(target).hostname or "",
                 with_script=kind in ("document", "iframe", "frame"),
-                with_widget=kind == "document",
             )
             out_type = "text/html; charset=utf-8"
         elif is_script:
@@ -1134,11 +1278,8 @@ def proxy_request(target, origin=None):
         apply_headers(upstream, response, target, origin, modified=True)
         response.headers["Content-Type"] = out_type
         if is_html:
-            vary = response.headers.get("Vary")
-            response.headers["Vary"] = (
-                (vary + ", " if vary else "") + "Cookie, Sec-Fetch-Dest"
-            )
-        return response
+            add_vary(response, "Cookie", "Sec-Fetch-Dest")
+        return maybe_gzip(response)
 
     if not has_body:
         upstream.close()
@@ -1205,6 +1346,13 @@ def index():
     response = make_response(HOME_PAGE)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.route("/__vpn/client.<version>.js")
+def client_script(version):
+    response = Response(CLIENT_JS, content_type="application/javascript; charset=utf-8")
+    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return maybe_gzip(response)
 
 
 @app.route("/__home")
